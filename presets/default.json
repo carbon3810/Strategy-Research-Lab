@@ -1,0 +1,50 @@
+{
+  "ema_periods": [
+    20,
+    50,
+    200
+  ],
+  "atr_period": 14,
+  "slope_lookback": 5,
+  "breakout_lookback": 20,
+  "max_conditions": 3,
+  "max_candidates": 300,
+  "min_trades": 100,
+  "rr_values": [
+    1.0,
+    1.5,
+    2.0
+  ],
+  "stop_mult_values": [
+    1.0,
+    1.5
+  ],
+  "max_hold_bars": 48,
+  "sides": [
+    "BUY",
+    "SELL"
+  ],
+  "split_years": {
+    "train_end": 2023,
+    "valid_end": 2024
+  },
+  "plugin_params": {
+    "rsi": {
+      "period": 14
+    },
+    "RSI_売られすぎ": {
+      "level": 30
+    },
+    "RSI_買われすぎ": {
+      "level": 70
+    },
+    "下ヒゲピンバー": {
+      "min_wick_ratio": 0.55,
+      "max_body_ratio": 0.35
+    },
+    "上ヒゲピンバー": {
+      "min_wick_ratio": 0.55,
+      "max_body_ratio": 0.35
+    }
+  }
+}
