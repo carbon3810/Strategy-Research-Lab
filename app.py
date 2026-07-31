@@ -1,10 +1,9 @@
-
 from __future__ import annotations
 import json, threading, traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from core import app_dir, ensure_external_assets, load_plugins, read_mt5_csv, add_builtin_features, align_higher, auto_discover, save_outputs
+from core import app_dir, ensure_external_assets, load_plugins, diagnose_mt5_csv, format_csv_diagnosis, read_mt5_csv, add_builtin_features, align_higher, auto_discover, save_outputs
 
 class SettingsValidationError(Exception):
     def __init__(self, errors):
@@ -151,8 +150,8 @@ class App(tk.Tk):
         ttk.Label(top,text="拡張型・研究用",foreground="#666").pack(side="left",padx=12)
 
         files=ttk.LabelFrame(self,text="データ"); files.pack(fill="x",padx=12,pady=6)
-        self._file_row(files,0,"上位足CSV",self.vars["htf"])
-        self._file_row(files,1,"下位足CSV",self.vars["ltf"])
+        self._file_row(files,0,"上位足CSV",self.vars["htf"],diagnosis_label="上位足を診断")
+        self._file_row(files,1,"下位足CSV",self.vars["ltf"],diagnosis_label="下位足を診断")
         self._dir_row(files,2,"出力フォルダ",self.vars["out"])
 
         preset=ttk.LabelFrame(self,text="設定JSON・プリセット（settings_used.jsonも読込可能）"); preset.pack(fill="x",padx=12,pady=6)
@@ -185,10 +184,16 @@ class App(tk.Tk):
                        foreground="#555")
         note.pack(fill="x",padx=14,pady=(0,8))
 
-    def _file_row(self,parent,row,label,var):
+    def _file_row(self,parent,row,label,var,diagnosis_label=None):
         ttk.Label(parent,text=label).grid(row=row,column=0,sticky="w",padx=8,pady=6)
         ttk.Entry(parent,textvariable=var).grid(row=row,column=1,sticky="ew",padx=8,pady=6)
         ttk.Button(parent,text="選択",command=lambda:self.pick_file(var)).grid(row=row,column=2,padx=8,pady=6)
+        if diagnosis_label:
+            ttk.Button(
+                parent,
+                text=diagnosis_label,
+                command=lambda:self.start_csv_diagnosis(var.get(), label)
+            ).grid(row=row,column=3,padx=8,pady=6)
         parent.columnconfigure(1,weight=1)
 
     def _dir_row(self,parent,row,label,var):
@@ -204,6 +209,46 @@ class App(tk.Tk):
         if p: var.set(p)
     def write(self,s):
         self.log.insert("end",str(s)+"\n"); self.log.see("end"); self.update_idletasks()
+
+    def start_csv_diagnosis(self, path, label):
+        if not path:
+            messagebox.showwarning("CSV診断", f"{label}を選択してください。")
+            return
+        self.status.set(f"{label}を診断中")
+        self.write(f"{label}のCSV診断を開始: {path}")
+        threading.Thread(
+            target=self.csv_diagnosis_worker,
+            args=(path, label),
+            daemon=True
+        ).start()
+
+    def csv_diagnosis_worker(self, path, label):
+        report = diagnose_mt5_csv(path)
+        text = format_csv_diagnosis(report)
+
+        def show_result():
+            self.write(text)
+            self.status.set("診断完了")
+            if report.get("ok"):
+                messagebox.showinfo(
+                    f"{label} CSV診断：読込可能",
+                    "CSVを正常に読み込めます。\n\n"
+                    f"有効ローソク足: {report['valid_bars']:,}本\n"
+                    f"推定時間足: {report['timeframe']}\n"
+                    f"期間: {report['first']} ～ {report['last']}\n"
+                    f"形式: {report['layout']}\n"
+                    f"文字コード: {report['encoding']}"
+                )
+            else:
+                problems = report.get("problems") or ["原因を特定できませんでした。"]
+                details = "\n".join(f"・{item}" for item in problems)
+                messagebox.showerror(
+                    f"{label} CSV診断：読込不可",
+                    "CSVを読み込めません。ログ欄に詳細を表示しました。\n\n"
+                    + details[:1800]
+                )
+
+        self.after(0, show_result)
 
     def reload_plugins(self):
         try:
@@ -312,6 +357,13 @@ class App(tk.Tk):
             details="\n".join(f"・{x}" for x in e.errors)
             self.after(0,lambda:self.write("設定エラー:\n"+details))
             self.after(0,lambda:messagebox.showerror("設定エラー","次の設定を修正してください。\n\n"+details))
+        except ValueError as e:
+            details=str(e)
+            self.after(0,lambda:self.write(details))
+            self.after(0,lambda:messagebox.showerror(
+                "CSVまたは入力データのエラー",
+                details[-1800:]
+            ))
         except Exception:
             err=traceback.format_exc()
             self.after(0,lambda:self.write(err))
