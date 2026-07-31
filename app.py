@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, threading, traceback
+import json, threading, traceback, time
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -138,6 +138,9 @@ class App(tk.Tk):
         self.minsize(850,650)
         ensure_external_assets()
         self.cfg={}
+        self.cancel_requested = False
+        self.run_started_at = None
+        self.last_progress_time = None
         self.vars={k:tk.StringVar() for k in ("htf","ltf","out","preset")}
         self._build()
         self.reload_plugins()
@@ -172,10 +175,28 @@ class App(tk.Tk):
             settings.columnconfigure(i%3,weight=1)
 
         action=ttk.Frame(self); action.pack(fill="x",padx=12,pady=8)
-        self.run_btn=ttk.Button(action,text="自動探索を開始",command=self.start); self.run_btn.pack(side="left")
-        self.progress=ttk.Progressbar(action,mode="determinate"); self.progress.pack(side="left",fill="x",expand=True,padx=10)
+        self.run_btn=ttk.Button(action,text="自動探索を開始",command=self.start)
+        self.run_btn.pack(side="left")
+
+        self.stop_btn=ttk.Button(
+            action,
+            text="途中中断",
+            command=self.request_cancel,
+            state="disabled"
+        )
+        self.stop_btn.pack(side="left",padx=(8,0))
+
+        self.progress=ttk.Progressbar(action,mode="determinate")
+        self.progress.pack(side="left",fill="x",expand=True,padx=10)
+
         self.status=tk.StringVar(value="準備完了")
         ttk.Label(action,textvariable=self.status).pack(side="right")
+
+        progress_info=ttk.Frame(self); progress_info.pack(fill="x",padx=12,pady=(0,8))
+        self.remaining_var=tk.StringVar(value="残り時間: --")
+        self.current_work_var=tk.StringVar(value="実施内容: --")
+        ttk.Label(progress_info,textvariable=self.remaining_var).pack(side="left")
+        ttk.Label(progress_info,textvariable=self.current_work_var).pack(side="right")
 
         logf=ttk.LabelFrame(self,text="ログ"); logf.pack(fill="both",expand=True,padx=12,pady=6)
         self.log=tk.Text(logf,wrap="word",height=18); self.log.pack(fill="both",expand=True,padx=6,pady=6)
@@ -329,10 +350,61 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("保存エラー",str(e))
 
+    def request_cancel(self):
+        if not self.run_started_at:
+            return
+        self.cancel_requested = True
+        self.stop_btn.configure(state="disabled")
+        self.status.set("中断要求を受付")
+        self.current_work_var.set("実施内容: 現在の計算単位が終わり次第停止します")
+        self.write("途中中断を要求しました。現在の計算単位が完了した時点で停止します。")
+
+    def is_cancel_requested(self):
+        return self.cancel_requested
+
+    def update_progress_display(self, done, total, detail):
+        now = time.time()
+        elapsed = max(now - self.run_started_at, 0.001) if self.run_started_at else 0.0
+        rate = done / elapsed if elapsed > 0 else 0.0
+        remaining_items = max(total - done, 0)
+        remaining_seconds = remaining_items / rate if rate > 0 else 0.0
+
+        def fmt_seconds(seconds):
+            seconds = int(max(seconds, 0))
+            hours, rem = divmod(seconds, 3600)
+            minutes, secs = divmod(rem, 60)
+            if hours:
+                return f"{hours}時間{minutes}分"
+            if minutes:
+                return f"{minutes}分{secs}秒"
+            return f"{secs}秒"
+
+        conditions = detail.get("conditions", "")
+        side = detail.get("side", "")
+        rr = detail.get("rr", "")
+        stop_atr = detail.get("stop_atr", "")
+        self.progress.configure(maximum=total, value=done)
+        self.status.set(f"{done}/{total}")
+        self.remaining_var.set(
+            f"残り時間: 約{fmt_seconds(remaining_seconds)} "
+            f"（残り{remaining_items:,}件）"
+        )
+        self.current_work_var.set(
+            f"実施内容: {conditions} / {side} / RR {rr} / SL ATR×{stop_atr}"
+        )
+
     def start(self):
         if not self.vars["ltf"].get() or not self.vars["out"].get():
             messagebox.showwarning("不足","下位足CSVと出力フォルダを選択してください"); return
-        self.run_btn.configure(state="disabled"); self.progress["value"]=0; self.status.set("処理中")
+        self.cancel_requested = False
+        self.run_started_at = time.time()
+        self.last_progress_time = self.run_started_at
+        self.run_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.progress["value"]=0
+        self.status.set("処理中")
+        self.remaining_var.set("残り時間: 計算中...")
+        self.current_work_var.set("実施内容: 初期化中")
         threading.Thread(target=self.worker,daemon=True).start()
 
     def worker(self):
@@ -347,9 +419,17 @@ class App(tk.Tk):
                 self.after(0,lambda:self.write(f"上位足: {hmeta}"))
                 hfeat=add_builtin_features(htf,cfg)
                 feat=align_higher(feat,hfeat)
-            def prog(done,total):
-                self.after(0,lambda d=done,t=total:(self.progress.configure(maximum=t,value=d),self.status.set(f"{d}/{t}")))
-            ranking,_=auto_discover(feat,cfg,prog)
+            def prog(done,total,detail):
+                self.after(
+                    0,
+                    lambda d=done,t=total,x=detail:self.update_progress_display(d,t,x)
+                )
+            ranking,_=auto_discover(
+                feat,
+                cfg,
+                progress=prog,
+                should_cancel=self.is_cancel_requested
+            )
             save_outputs(self.vars["out"].get(),ranking,feat,cfg)
             self.after(0,lambda:self.write(f"完了: {len(ranking):,}候補を保存"))
             self.after(0,lambda:messagebox.showinfo("完了","自動探索が完了しました。\nstrategy_ranking.csv をGPTへ渡して研究を続けてください。"))
@@ -357,6 +437,13 @@ class App(tk.Tk):
             details="\n".join(f"・{x}" for x in e.errors)
             self.after(0,lambda:self.write("設定エラー:\n"+details))
             self.after(0,lambda:messagebox.showerror("設定エラー","次の設定を修正してください。\n\n"+details))
+        except InterruptedError as e:
+            details=str(e)
+            self.after(0,lambda:self.write(details))
+            self.after(0,lambda:self.status.set("中断済み"))
+            self.after(0,lambda:self.remaining_var.set("残り時間: 中断"))
+            self.after(0,lambda:self.current_work_var.set("実施内容: 中断されました"))
+            self.after(0,lambda:messagebox.showinfo("中断",details))
         except ValueError as e:
             details=str(e)
             self.after(0,lambda:self.write(details))
@@ -369,7 +456,13 @@ class App(tk.Tk):
             self.after(0,lambda:self.write(err))
             self.after(0,lambda:messagebox.showerror("エラー",err[-1500:]))
         finally:
-            self.after(0,lambda:(self.run_btn.configure(state="normal"),self.status.set("完了")))
+            def finish_ui():
+                self.run_btn.configure(state="normal")
+                self.stop_btn.configure(state="disabled")
+                if self.status.get() not in ("中断済み",):
+                    self.status.set("完了")
+                self.run_started_at = None
+            self.after(0,finish_ui)
 
 if __name__=="__main__":
     App().mainloop()
