@@ -1,6 +1,6 @@
+
 from __future__ import annotations
-import json, threading, traceback, time
-from datetime import datetime
+import json, threading, traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -135,15 +135,10 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Strategy Research Lab")
-        self.geometry("1180x820")
-        self.minsize(980,720)
+        self.geometry("950x720")
+        self.minsize(850,650)
         ensure_external_assets()
         self.cfg={}
-        self.cancel_requested = False
-        self.run_started_at = None
-        self.last_progress_time = None
-        self.stage_started_at = None
-        self.stage_name = ""
         self.vars={k:tk.StringVar() for k in ("htf","ltf","out","preset")}
         self._build()
         self.reload_plugins()
@@ -177,56 +172,11 @@ class App(tk.Tk):
             ttk.Entry(settings,textvariable=v,width=16).grid(row=i//3*2+1,column=i%3,sticky="ew",**pad)
             settings.columnconfigure(i%3,weight=1)
 
-        progress_box=ttk.LabelFrame(self,text="処理状況")
-        progress_box.pack(fill="x",padx=12,pady=8)
-
-        action=ttk.Frame(progress_box)
-        action.pack(fill="x",padx=8,pady=(8,4))
-        self.run_btn=ttk.Button(action,text="自動探索を開始",command=self.start)
-        self.run_btn.pack(side="left")
-        self.stop_btn=ttk.Button(
-            action,text="途中中断",command=self.request_cancel,state="disabled"
-        )
-        self.stop_btn.pack(side="left",padx=(8,0))
+        action=ttk.Frame(self); action.pack(fill="x",padx=12,pady=8)
+        self.run_btn=ttk.Button(action,text="自動探索を開始",command=self.start); self.run_btn.pack(side="left")
+        self.progress=ttk.Progressbar(action,mode="determinate"); self.progress.pack(side="left",fill="x",expand=True,padx=10)
         self.status=tk.StringVar(value="準備完了")
-        ttk.Label(action,textvariable=self.status,font=("",10,"bold")).pack(side="right")
-
-        ttk.Label(progress_box,text="全体進捗").pack(anchor="w",padx=8)
-        self.overall_progress=ttk.Progressbar(
-            progress_box,mode="determinate",maximum=100
-        )
-        self.overall_progress.pack(fill="x",padx=8,pady=(2,6))
-
-        stage_line=ttk.Frame(progress_box)
-        stage_line.pack(fill="x",padx=8)
-        self.stage_var=tk.StringVar(value="STEP --/--：待機中")
-        ttk.Label(
-            stage_line,textvariable=self.stage_var,font=("",10,"bold")
-        ).pack(side="left")
-        self.stage_percent_var=tk.StringVar(value="")
-        ttk.Label(stage_line,textvariable=self.stage_percent_var).pack(side="right")
-
-        self.progress=ttk.Progressbar(progress_box,mode="determinate")
-        self.progress.pack(fill="x",padx=8,pady=(2,6))
-
-        info=ttk.Frame(progress_box)
-        info.pack(fill="x",padx=8,pady=(0,4))
-        self.elapsed_var=tk.StringVar(value="経過時間: --")
-        self.remaining_var=tk.StringVar(value="残り時間: --")
-        self.finish_var=tk.StringVar(value="予想終了: --")
-        ttk.Label(info,textvariable=self.elapsed_var).pack(side="left")
-        ttk.Label(info,textvariable=self.remaining_var).pack(side="left",padx=28)
-        ttk.Label(info,textvariable=self.finish_var).pack(side="left")
-
-        self.current_work_var=tk.StringVar(value="現在: --")
-        ttk.Label(
-            progress_box,textvariable=self.current_work_var,wraplength=1120
-        ).pack(anchor="w",padx=8,pady=(0,3))
-
-        self.next_work_var=tk.StringVar(value="次の処理: --")
-        ttk.Label(
-            progress_box,textvariable=self.next_work_var,wraplength=1120
-        ).pack(anchor="w",padx=8,pady=(0,8))
+        ttk.Label(action,textvariable=self.status).pack(side="right")
 
         logf=ttk.LabelFrame(self,text="ログ"); logf.pack(fill="both",expand=True,padx=12,pady=6)
         self.log=tk.Text(logf,wrap="word",height=18); self.log.pack(fill="both",expand=True,padx=6,pady=6)
@@ -380,283 +330,47 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("保存エラー",str(e))
 
-    def _format_seconds(self, seconds):
-        if seconds is None or not isinstance(seconds, (int, float)) or seconds < 0:
-            return "--"
-        seconds = int(seconds)
-        hours, rem = divmod(seconds, 3600)
-        minutes, secs = divmod(rem, 60)
-        if hours:
-            return f"{hours}時間{minutes}分{secs}秒"
-        if minutes:
-            return f"{minutes}分{secs}秒"
-        return f"{secs}秒"
-
-    def _update_clock(self, remaining_seconds=None):
-        if not self.run_started_at:
-            return
-        elapsed = time.time() - self.run_started_at
-        self.elapsed_var.set(f"経過時間: {self._format_seconds(elapsed)}")
-        if remaining_seconds is not None:
-            self.remaining_var.set(
-                f"残り時間: 約{self._format_seconds(remaining_seconds)}"
-            )
-            finish = datetime.fromtimestamp(time.time() + max(remaining_seconds, 0))
-            self.finish_var.set(f"予想終了: {finish.strftime('%H:%M:%S')}")
-
-    def set_stage(self, step, total, message, next_message="", stage_max=100):
-        self.stage_started_at = time.time()
-        self.stage_name = message
-        self.stage_var.set(f"STEP {step}/{total}：{message}")
-        self.stage_percent_var.set("0%")
-        self.progress.configure(maximum=max(stage_max, 1), value=0)
-        self.overall_progress.configure(
-            value=max(0, min(100, ((step - 1) / total) * 100))
-        )
-        self.current_work_var.set(f"現在: {message}")
-        self.next_work_var.set(f"次の処理: {next_message or '--'}")
-        self.status.set(f"STEP {step}/{total}")
-        self.write(
-            f"[{datetime.now().strftime('%H:%M:%S')}] "
-            f"STEP {step}/{total} | {message}"
-        )
-        self._update_clock()
-
-    def update_stage_progress(
-        self, step, total_steps, done, total, message,
-        next_message="", overall_start=None, overall_end=None
-    ):
-        total = max(int(total), 1)
-        done = max(0, min(int(done), total))
-        fraction = done / total
-        self.progress.configure(maximum=total, value=done)
-        self.stage_percent_var.set(f"{fraction * 100:.1f}%")
-        self.current_work_var.set(f"現在: {message}")
-        if next_message:
-            self.next_work_var.set(f"次の処理: {next_message}")
-
-        if overall_start is None:
-            overall_start = (step - 1) / total_steps
-        if overall_end is None:
-            overall_end = step / total_steps
-        overall_fraction = overall_start + (overall_end - overall_start) * fraction
-        self.overall_progress.configure(value=max(0, min(100, overall_fraction * 100)))
-
-        stage_elapsed = max(time.time() - (self.stage_started_at or time.time()), 0.001)
-        stage_rate = done / stage_elapsed if done > 0 else 0.0
-        stage_remaining = (total - done) / stage_rate if stage_rate > 0 else None
-        self._update_clock(stage_remaining)
-
-    def request_cancel(self):
-        if not self.run_started_at:
-            return
-        self.cancel_requested = True
-        self.stop_btn.configure(state="disabled")
-        self.status.set("中断要求を受付")
-        self.current_work_var.set("現在: 安全に停止するため、現在の計算単位を終了中")
-        self.next_work_var.set("次の処理: 中断")
-        self.write("途中中断を要求しました。現在の計算単位が完了した時点で停止します。")
-
-    def is_cancel_requested(self):
-        return self.cancel_requested
-
-    def update_search_progress(self, done, total, detail):
-        elapsed = max(time.time() - self.stage_started_at, 0.001)
-        rate = done / elapsed if done > 0 else 0.0
-        remaining = (total - done) / rate if rate > 0 else None
-        conditions = detail.get("conditions", "")
-        side = detail.get("side", "")
-        rr = detail.get("rr", "")
-        stop_atr = detail.get("stop_atr", "")
-        message = f"{conditions} / {side} / RR {rr} / SL ATR×{stop_atr}"
-
-        self.progress.configure(maximum=total, value=done)
-        self.stage_percent_var.set(f"{done / max(total,1) * 100:.1f}%")
-        self.status.set(f"{done:,}/{total:,}")
-        self.current_work_var.set(f"現在: {message}")
-        self.next_work_var.set("次の処理: 候補ランキング作成 → 結果保存")
-        self.remaining_var.set(
-            f"残り時間: 約{self._format_seconds(remaining)} "
-            f"（残り{max(total-done,0):,}件）"
-        )
-        if remaining is not None:
-            finish = datetime.fromtimestamp(time.time() + remaining)
-            self.finish_var.set(f"予想終了: {finish.strftime('%H:%M:%S')}")
-        self.elapsed_var.set(
-            f"経過時間: {self._format_seconds(time.time()-self.run_started_at)}"
-        )
-        self.overall_progress.configure(value=70 + 25 * done / max(total,1))
-
     def start(self):
         if not self.vars["ltf"].get() or not self.vars["out"].get():
             messagebox.showwarning("不足","下位足CSVと出力フォルダを選択してください"); return
-        self.cancel_requested = False
-        self.run_started_at = time.time()
-        self.last_progress_time = self.run_started_at
-        self.run_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.progress["value"]=0
-        self.overall_progress["value"]=0
-        self.status.set("処理中")
-        self.elapsed_var.set("経過時間: 0秒")
-        self.remaining_var.set("残り時間: 計算中...")
-        self.finish_var.set("予想終了: 計算中...")
-        self.current_work_var.set("現在: 開始準備中")
-        self.next_work_var.set("次の処理: 下位足CSV読込")
+        self.run_btn.configure(state="disabled"); self.progress["value"]=0; self.status.set("処理中")
         threading.Thread(target=self.worker,daemon=True).start()
 
     def worker(self):
-        total_steps = 9
         try:
-            cfg = self.sync_cfg()
-
-            self.after(0, lambda: self.set_stage(
-                1,total_steps,"下位足CSVを読み込み中","下位足の特徴量生成"
-            ))
-            ltf, meta = read_mt5_csv(self.vars["ltf"].get())
-            self.after(0, lambda m=meta: self.write(f"下位足読込完了: {m}"))
-            if self.is_cancel_requested():
-                raise InterruptedError("ユーザー操作により処理を中断しました。")
-
-            self.after(0, lambda: self.set_stage(
-                2,total_steps,"下位足の特徴量を生成中","上位足CSV読込",stage_max=10
-            ))
-            feature_counter = {"done": 0}
-            def ltf_feature_log(message):
-                feature_counter["done"] += 1
-                self.after(0, lambda d=feature_counter["done"], msg=message:
-                    self.update_stage_progress(
-                        2,total_steps,d,10,msg,"上位足CSV読込",
-                        overall_start=0.08,overall_end=0.25
-                    ))
-            feat = add_builtin_features(
-                ltf,cfg,progress=ltf_feature_log,
-                should_cancel=self.is_cancel_requested,label="下位足"
-            )
-
+            cfg=self.sync_cfg()
+            self.after(0,lambda:self.write("下位足CSVを読込中..."))
+            ltf,meta=read_mt5_csv(self.vars["ltf"].get())
+            self.after(0,lambda:self.write(f"下位足: {meta}"))
+            feat=add_builtin_features(ltf,cfg)
             if self.vars["htf"].get():
-                self.after(0, lambda: self.set_stage(
-                    3,total_steps,"上位足CSVを読み込み中","上位足の特徴量生成"
-                ))
-                htf, hmeta = read_mt5_csv(self.vars["htf"].get())
-                self.after(0, lambda m=hmeta: self.write(f"上位足読込完了: {m}"))
-
-                self.after(0, lambda: self.set_stage(
-                    4,total_steps,"上位足の特徴量を生成中","時間足同期",stage_max=10
-                ))
-                htf_counter = {"done": 0}
-                def htf_feature_log(message):
-                    htf_counter["done"] += 1
-                    self.after(0, lambda d=htf_counter["done"], msg=message:
-                        self.update_stage_progress(
-                            4,total_steps,d,10,msg,"時間足同期",
-                            overall_start=0.30,overall_end=0.42
-                        ))
-                hfeat = add_builtin_features(
-                    htf,cfg,progress=htf_feature_log,
-                    should_cancel=self.is_cancel_requested,label="上位足"
-                )
-
-                self.after(0, lambda: self.set_stage(
-                    5,total_steps,"上位足と下位足を同期中","探索条件生成"
-                ))
-                feat = align_higher(feat,hfeat)
-                self.after(0, lambda: self.write(f"時間足同期完了: {len(feat):,}本"))
-            else:
-                self.after(0, lambda: self.write("上位足処理をスキップしました。"))
-
-            self.after(0, lambda: self.set_stage(
-                6,total_steps,"探索条件を生成中","SL/TP結果の高速事前計算"
-            ))
-
-            def stage_progress(phase, done, total, message):
-                if phase == "conditions":
-                    step, next_msg = 6, "SL/TP結果の高速事前計算"
-                    start_f, end_f = 0.50, 0.55
-                else:
-                    step, next_msg = 7, "候補条件の自動探索"
-                    start_f, end_f = 0.55, 0.70
-                    if done == 0:
-                        self.after(0, lambda: self.set_stage(
-                            7,total_steps,"SL/TP結果を高速事前計算中",
-                            "候補条件の自動探索",stage_max=total
-                        ))
-                self.after(0, lambda s=step,d=done,t=total,msg=message,n=next_msg,a=start_f,b=end_f:
-                    self.update_stage_progress(
-                        s,total_steps,d,t,msg,n,
-                        overall_start=a,overall_end=b
-                    ))
-
-            search_started = {"set": False}
-            last_logged = {"done": 0}
-            def prog(done,total,detail):
-                if not search_started["set"]:
-                    search_started["set"] = True
-                    self.after(0, lambda: self.set_stage(
-                        8,total_steps,"候補条件を自動探索中",
-                        "ランキング作成・結果保存",stage_max=total
-                    ))
-                self.after(0, lambda d=done,t=total,x=detail:
-                    self.update_search_progress(d,t,x))
-                if done == total or done-last_logged["done"] >= 250:
-                    last_logged["done"] = done
-                    self.after(0, lambda d=done,t=total:
-                        self.write(f"探索進捗: {d:,}/{t:,}"))
-
-            ranking,_ = auto_discover(
-                feat,cfg,progress=prog,
-                should_cancel=self.is_cancel_requested,
-                stage_progress=stage_progress
-            )
-
-            self.after(0, lambda: self.set_stage(
-                9,total_steps,"ランキング作成・結果を保存中","完了"
-            ))
+                htf,hmeta=read_mt5_csv(self.vars["htf"].get())
+                self.after(0,lambda:self.write(f"上位足: {hmeta}"))
+                hfeat=add_builtin_features(htf,cfg)
+                feat=align_higher(feat,hfeat)
+            def prog(done,total):
+                self.after(0,lambda d=done,t=total:(self.progress.configure(maximum=t,value=d),self.status.set(f"{d}/{t}")))
+            ranking,_=auto_discover(feat,cfg,prog)
             save_outputs(self.vars["out"].get(),ranking,feat,cfg)
-            self.after(0, lambda: self.overall_progress.configure(value=100))
-            self.after(0, lambda: self.progress.configure(maximum=1,value=1))
-            self.after(0, lambda: self.stage_percent_var.set("100%"))
-            self.after(0, lambda: self.current_work_var.set(
-                f"現在: 完了（採用候補 {len(ranking):,}件）"
-            ))
-            self.after(0, lambda: self.next_work_var.set("次の処理: 結果CSVを確認"))
-            self.after(0, lambda: self.remaining_var.set("残り時間: 0秒"))
-            self.after(0, lambda: self.finish_var.set(
-                f"終了時刻: {datetime.now().strftime('%H:%M:%S')}"
-            ))
-            self.after(0, lambda: self.write(
-                f"完了: {self.vars['out'].get()} / 候補 {len(ranking):,}件"
-            ))
-            self.after(0, lambda: messagebox.showinfo(
-                "完了",f"出力完了\n候補数: {len(ranking):,}"
-            ))
-
-        except InterruptedError as e:
-            details=str(e)
-            self.after(0,lambda:self.write(details))
-            self.after(0,lambda:self.status.set("中断済み"))
-            self.after(0,lambda:self.remaining_var.set("残り時間: 中断"))
-            self.after(0,lambda:self.finish_var.set(
-                f"中断時刻: {datetime.now().strftime('%H:%M:%S')}"
-            ))
-            self.after(0,lambda:self.current_work_var.set("現在: 中断されました"))
-            self.after(0,lambda:self.next_work_var.set("次の処理: 設定を確認して再実行"))
-            self.after(0,lambda:messagebox.showinfo("中断",details))
+            self.after(0,lambda:self.write(f"完了: {len(ranking):,}候補を保存"))
+            self.after(0,lambda:messagebox.showinfo("完了","自動探索が完了しました。\nstrategy_ranking.csv をGPTへ渡して研究を続けてください。"))
+        except SettingsValidationError as e:
+            details="\n".join(f"・{x}" for x in e.errors)
+            self.after(0,lambda:self.write("設定エラー:\n"+details))
+            self.after(0,lambda:messagebox.showerror("設定エラー","次の設定を修正してください。\n\n"+details))
         except ValueError as e:
             details=str(e)
             self.after(0,lambda:self.write(details))
             self.after(0,lambda:messagebox.showerror(
-                "CSVまたは入力データのエラー",details[-1800:]
+                "CSVまたは入力データのエラー",
+                details[-1800:]
             ))
         except Exception:
             err=traceback.format_exc()
             self.after(0,lambda:self.write(err))
-            self.after(0,lambda:messagebox.showerror("エラー",err[-1800:]))
+            self.after(0,lambda:messagebox.showerror("エラー",err[-1500:]))
         finally:
-            def finish_ui():
-                self.run_btn.configure(state="normal")
-                self.stop_btn.configure(state="disabled")
-                if self.status.get() not in ("中断済み",):
-                    self.status.set("完了")
-                self.run_started_at=None
-            self.after(0,finish_ui)
+            self.after(0,lambda:(self.run_btn.configure(state="normal"),self.status.set("完了")))
+
+if __name__=="__main__":
+    App().mainloop()
