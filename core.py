@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import csv, json, math, re, importlib.util, sys
 from pathlib import Path
@@ -49,57 +48,492 @@ def load_plugins() -> list[str]:
         raise RuntimeError("プラグイン読込エラー\n" + "\n".join(errors))
     return loaded
 
-def _decode(path: Path) -> tuple[str,str]:
+def _decode(path: Path) -> tuple[str, str]:
     raw = path.read_bytes()
-    for enc in ("utf-16","utf-8-sig","cp932","utf-8"):
+    if not raw:
+        raise ValueError("CSVファイルが空です。")
+
+    attempts = []
+    for enc in ("utf-16", "utf-8-sig", "cp932", "utf-8"):
         try:
             return raw.decode(enc), enc
-        except UnicodeDecodeError:
-            pass
-    raise ValueError("文字コードを判定できません")
+        except UnicodeDecodeError as exc:
+            attempts.append(f"{enc}: byte {exc.start}")
+
+    raise ValueError(
+        "文字コードを判定できません。対応文字コードは UTF-16、UTF-8、CP932 です。\n"
+        + "\n".join(attempts)
+    )
+
+
+def _normalize_header(value: str) -> str:
+    return (
+        str(value)
+        .strip()
+        .lower()
+        .replace("<", "")
+        .replace(">", "")
+        .replace(" ", "_")
+    )
+
+
+def _parse_datetime(values: pd.Series) -> pd.Series:
+    """MT5でよく使われる日時形式を段階的に解析する。"""
+    text = values.astype(str).str.strip()
+    result = pd.Series(pd.NaT, index=text.index, dtype="datetime64[ns]")
+
+    formats = (
+        "%Y.%m.%d %H:%M:%S",
+        "%Y.%m.%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    )
+    for fmt in formats:
+        missing = result.isna()
+        if not missing.any():
+            break
+        result.loc[missing] = pd.to_datetime(
+            text.loc[missing], format=fmt, errors="coerce"
+        )
+
+    missing = result.isna()
+    if missing.any():
+        result.loc[missing] = pd.to_datetime(
+            text.loc[missing], errors="coerce", dayfirst=False
+        )
+    return result
+
+
+def _infer_timeframe(times: pd.Series) -> str:
+    diffs = times.sort_values().diff().dropna()
+    diffs = diffs[diffs > pd.Timedelta(0)]
+    if diffs.empty:
+        return "判定不能"
+
+    seconds = int(diffs.dt.total_seconds().median())
+    mapping = {
+        60: "M1",
+        300: "M5",
+        900: "M15",
+        1800: "M30",
+        3600: "H1",
+        14400: "H4",
+        86400: "D1",
+        604800: "W1",
+    }
+    if seconds in mapping:
+        return mapping[seconds]
+    if seconds % 86400 == 0:
+        return f"D{seconds // 86400}"
+    if seconds % 3600 == 0:
+        return f"H{seconds // 3600}"
+    if seconds % 60 == 0:
+        return f"M{seconds // 60}"
+    return f"{seconds}秒"
+
+
+def diagnose_mt5_csv(path: str) -> dict:
+    """
+    CSVを解析し、読込可否と失敗箇所を詳細に返す。
+    この関数自体は、可能な限り例外を外へ出さず診断結果に格納する。
+    """
+    report = {
+        "ok": False,
+        "file": str(path),
+        "file_name": Path(path).name if path else "",
+        "file_size_bytes": 0,
+        "encoding": "不明",
+        "delimiter": "不明",
+        "header": "不明",
+        "layout": "不明",
+        "total_rows": 0,
+        "column_count": 0,
+        "valid_bars": 0,
+        "invalid_rows": 0,
+        "invalid_datetime": 0,
+        "invalid_open": 0,
+        "invalid_high": 0,
+        "invalid_low": 0,
+        "invalid_close": 0,
+        "duplicate_times": 0,
+        "first": "",
+        "last": "",
+        "timeframe": "判定不能",
+        "sample_rows": [],
+        "problems": [],
+        "warnings": [],
+    }
+
+    try:
+        p = Path(path)
+        if not path:
+            report["problems"].append("CSVファイルが指定されていません。")
+            return report
+        if not p.exists():
+            report["problems"].append(f"ファイルが見つかりません: {p}")
+            return report
+        if not p.is_file():
+            report["problems"].append(f"ファイルではありません: {p}")
+            return report
+
+        report["file_size_bytes"] = p.stat().st_size
+        text, enc = _decode(p)
+        report["encoding"] = enc
+
+        sample = text[:10000]
+        delimiter_counts = {
+            "タブ": sample.count("\t"),
+            "カンマ": sample.count(","),
+            "セミコロン": sample.count(";"),
+        }
+        delimiter_name = max(delimiter_counts, key=delimiter_counts.get)
+        delimiter = {"タブ": "\t", "カンマ": ",", "セミコロン": ";"}[delimiter_name]
+        report["delimiter"] = delimiter_name
+
+        rows = list(csv.reader(text.splitlines(), delimiter=delimiter))
+        rows = [row for row in rows if row and any(str(v).strip() for v in row)]
+        report["total_rows"] = len(rows)
+
+        if not rows:
+            report["problems"].append("CSVに有効な行がありません。")
+            return report
+
+        report["column_count"] = max(len(row) for row in rows)
+        report["sample_rows"] = rows[:3]
+
+        first_norm = [_normalize_header(v) for v in rows[0]]
+        header_tokens = {
+            "date", "time", "datetime", "open", "high", "low", "close",
+            "tickvol", "tick_volume", "volume", "spread"
+        }
+        has_header = any(v in header_tokens for v in first_norm)
+        report["header"] = "あり" if has_header else "なし"
+
+        data = rows[1:] if has_header else rows
+        if not data:
+            report["problems"].append("ヘッダー以外のデータ行がありません。")
+            return report
+
+        lengths = pd.Series([len(row) for row in data])
+        common_columns = int(lengths.mode().iloc[0])
+        irregular_count = int((lengths != common_columns).sum())
+        if irregular_count:
+            report["warnings"].append(
+                f"列数が揃っていない行が {irregular_count:,} 行あります。"
+                f" 最頻列数は {common_columns} 列です。"
+            )
+
+        raw = pd.DataFrame(data)
+        out = pd.DataFrame(index=raw.index)
+
+        if has_header:
+            columns = first_norm
+            if len(columns) < raw.shape[1]:
+                columns += [f"unknown_{i}" for i in range(len(columns), raw.shape[1])]
+            raw.columns = columns[:raw.shape[1]]
+
+            if "date" in raw.columns and "time" in raw.columns:
+                dt_text = raw["date"].astype(str) + " " + raw["time"].astype(str)
+                report["layout"] = "ヘッダーあり・日付列と時刻列が別"
+            elif "datetime" in raw.columns:
+                dt_text = raw["datetime"]
+                report["layout"] = "ヘッダーあり・日時1列"
+            elif "time" in raw.columns:
+                dt_text = raw["time"]
+                report["layout"] = "ヘッダーあり・日時1列"
+            else:
+                dt_text = raw.iloc[:, 0]
+                report["layout"] = "ヘッダーあり・先頭列を日時として推定"
+                report["warnings"].append(
+                    "DATE/TIME列名を認識できなかったため、先頭列を日時として使用しました。"
+                )
+
+            aliases = {
+                "open": ("open",),
+                "high": ("high",),
+                "low": ("low",),
+                "close": ("close",),
+                "tick_volume": ("tick_volume", "tickvol", "tickvolume"),
+                "volume": ("volume", "vol"),
+                "spread": ("spread",),
+            }
+            source_columns = {}
+            for target, candidates in aliases.items():
+                for candidate in candidates:
+                    if candidate in raw.columns:
+                        source_columns[target] = candidate
+                        break
+
+            missing = [name for name in ("open", "high", "low", "close")
+                       if name not in source_columns]
+            if missing:
+                report["problems"].append(
+                    "必須列を認識できません: " + ", ".join(missing)
+                )
+                report["problems"].append(
+                    "認識した列名: " + ", ".join(map(str, raw.columns))
+                )
+                return report
+
+            out["time"] = _parse_datetime(dt_text)
+            for target, source in source_columns.items():
+                out[target] = pd.to_numeric(raw[source], errors="coerce")
+
+        else:
+            # MT5の代表的な2形式を自動判別する。
+            # 形式A: 日時, OPEN, HIGH, LOW, CLOSE, TICKVOL, VOL[, SPREAD]
+            # 形式B: DATE, TIME, OPEN, HIGH, LOW, CLOSE, TICKVOL, VOL[, SPREAD]
+            first_value = raw.iloc[:, 0].astype(str)
+            first_has_time = first_value.str.contains(
+                r"\d{1,2}:\d{2}", regex=True, na=False
+            ).mean() > 0.5
+
+            if first_has_time and raw.shape[1] >= 5:
+                report["layout"] = "ヘッダーなし・日時1列"
+                dt_text = raw.iloc[:, 0]
+                price_start = 1
+            elif raw.shape[1] >= 6:
+                report["layout"] = "ヘッダーなし・日付列と時刻列が別"
+                dt_text = raw.iloc[:, 0].astype(str) + " " + raw.iloc[:, 1].astype(str)
+                price_start = 2
+            else:
+                report["problems"].append(
+                    f"MT5形式として列数が不足しています。検出列数={raw.shape[1]}"
+                )
+                report["problems"].append(
+                    "必要形式: 日時,OPEN,HIGH,LOW,CLOSE,... または "
+                    "DATE,TIME,OPEN,HIGH,LOW,CLOSE,..."
+                )
+                return report
+
+            if raw.shape[1] < price_start + 4:
+                report["problems"].append(
+                    f"OHLC列が不足しています。検出列数={raw.shape[1]}"
+                )
+                return report
+
+            out["time"] = _parse_datetime(dt_text)
+            names = ["open", "high", "low", "close",
+                     "tick_volume", "volume", "spread"]
+            for offset, name in enumerate(names):
+                column_index = price_start + offset
+                if column_index < raw.shape[1]:
+                    out[name] = pd.to_numeric(raw.iloc[:, column_index], errors="coerce")
+
+        required = ("time", "open", "high", "low", "close")
+        for column in required:
+            if column not in out.columns:
+                report["problems"].append(f"内部解析で {column} 列を生成できませんでした。")
+                return report
+
+        report["invalid_datetime"] = int(out["time"].isna().sum())
+        report["invalid_open"] = int(out["open"].isna().sum())
+        report["invalid_high"] = int(out["high"].isna().sum())
+        report["invalid_low"] = int(out["low"].isna().sum())
+        report["invalid_close"] = int(out["close"].isna().sum())
+
+        valid_mask = out[list(required)].notna().all(axis=1)
+        valid = out.loc[valid_mask].copy()
+        report["valid_bars"] = len(valid)
+        report["invalid_rows"] = len(out) - len(valid)
+
+        if not valid.empty:
+            report["duplicate_times"] = int(valid["time"].duplicated().sum())
+            valid = (
+                valid.sort_values("time")
+                .drop_duplicates("time")
+                .reset_index(drop=True)
+            )
+            report["first"] = str(valid["time"].iloc[0])
+            report["last"] = str(valid["time"].iloc[-1])
+            report["timeframe"] = _infer_timeframe(valid["time"])
+
+            impossible_ohlc = (
+                (valid["high"] < valid[["open", "close", "low"]].max(axis=1))
+                | (valid["low"] > valid[["open", "close", "high"]].min(axis=1))
+            )
+            impossible_count = int(impossible_ohlc.sum())
+            if impossible_count:
+                report["warnings"].append(
+                    f"OHLC関係が不自然な行が {impossible_count:,} 行あります。"
+                )
+
+        if report["invalid_datetime"]:
+            report["problems"].append(
+                f"日時を解析できない行が {report['invalid_datetime']:,} 行あります。"
+            )
+        for label, key in (
+            ("OPEN", "invalid_open"),
+            ("HIGH", "invalid_high"),
+            ("LOW", "invalid_low"),
+            ("CLOSE", "invalid_close"),
+        ):
+            if report[key]:
+                report["problems"].append(
+                    f"{label}を数値として読めない行が {report[key]:,} 行あります。"
+                )
+
+        if report["valid_bars"] < 100:
+            report["problems"].append(
+                f"有効なローソク足が100本未満です。"
+                f" 有効={report['valid_bars']:,} / 総データ={len(out):,}"
+            )
+        else:
+            report["ok"] = True
+
+        return report
+
+    except Exception as exc:
+        report["problems"].append(
+            f"{type(exc).__name__}: {exc}"
+        )
+        return report
+
+
+def format_csv_diagnosis(report: dict) -> str:
+    status = "読込可能" if report.get("ok") else "読込不可"
+    size_mb = report.get("file_size_bytes", 0) / 1024 / 1024
+    lines = [
+        "=" * 58,
+        "CSV診断結果",
+        "=" * 58,
+        f"状態             : {status}",
+        f"ファイル         : {report.get('file', '')}",
+        f"ファイルサイズ   : {size_mb:.2f} MB",
+        f"文字コード       : {report.get('encoding', '不明')}",
+        f"区切り文字       : {report.get('delimiter', '不明')}",
+        f"ヘッダー         : {report.get('header', '不明')}",
+        f"認識形式         : {report.get('layout', '不明')}",
+        f"検出列数         : {report.get('column_count', 0):,}",
+        f"総行数           : {report.get('total_rows', 0):,}",
+        f"有効ローソク足   : {report.get('valid_bars', 0):,}",
+        f"無効行           : {report.get('invalid_rows', 0):,}",
+        f"日時NG           : {report.get('invalid_datetime', 0):,}",
+        f"OPEN NG          : {report.get('invalid_open', 0):,}",
+        f"HIGH NG          : {report.get('invalid_high', 0):,}",
+        f"LOW NG           : {report.get('invalid_low', 0):,}",
+        f"CLOSE NG         : {report.get('invalid_close', 0):,}",
+        f"重複日時         : {report.get('duplicate_times', 0):,}",
+        f"推定時間足       : {report.get('timeframe', '判定不能')}",
+        f"開始日時         : {report.get('first', '')}",
+        f"終了日時         : {report.get('last', '')}",
+    ]
+
+    samples = report.get("sample_rows") or []
+    if samples:
+        lines.extend(["", "先頭行サンプル:"])
+        for index, row in enumerate(samples, start=1):
+            preview = " | ".join(map(str, row))
+            if len(preview) > 220:
+                preview = preview[:217] + "..."
+            lines.append(f"  {index}: {preview}")
+
+    warnings = report.get("warnings") or []
+    if warnings:
+        lines.extend(["", "警告:"])
+        lines.extend(f"  ・{item}" for item in warnings)
+
+    problems = report.get("problems") or []
+    if problems:
+        lines.extend(["", "問題点:"])
+        lines.extend(f"  ・{item}" for item in problems)
+
+    lines.append("=" * 58)
+    return "\n".join(lines)
+
 
 def read_mt5_csv(path: str) -> tuple[pd.DataFrame, dict]:
+    report = diagnose_mt5_csv(path)
+    if not report["ok"]:
+        raise ValueError(format_csv_diagnosis(report))
+
     p = Path(path)
-    text, enc = _decode(p)
-    sample = text[:5000]
-    delim = "\t" if sample.count("\t") > sample.count(",") else ","
-    rows = list(csv.reader(text.splitlines(), delimiter=delim))
-    rows = [r for r in rows if r and any(str(x).strip() for x in r)]
-    if not rows:
-        raise ValueError("CSVが空です")
-    first = [str(x).strip().lower().replace("<","").replace(">","") for x in rows[0]]
-    has_header = any(x in first for x in ("date","time","open","high","low","close"))
+    text, _ = _decode(p)
+    delimiter = {"タブ": "\t", "カンマ": ",", "セミコロン": ";"}.get(
+        report["delimiter"], ","
+    )
+    rows = list(csv.reader(text.splitlines(), delimiter=delimiter))
+    rows = [row for row in rows if row and any(str(v).strip() for v in row)]
+
+    first_norm = [_normalize_header(v) for v in rows[0]]
+    header_tokens = {
+        "date", "time", "datetime", "open", "high", "low", "close",
+        "tickvol", "tick_volume", "volume", "spread"
+    }
+    has_header = any(v in header_tokens for v in first_norm)
     data = rows[1:] if has_header else rows
+    raw = pd.DataFrame(data)
+    out = pd.DataFrame(index=raw.index)
+
     if has_header:
-        cols = first
-        df = pd.DataFrame(data, columns=cols[:len(data[0])])
-        if "date" in df and "time" in df:
-            dt = df["date"].astype(str)+" "+df["time"].astype(str)
-        elif "time" in df:
-            dt = df["time"].astype(str)
+        columns = first_norm
+        if len(columns) < raw.shape[1]:
+            columns += [f"unknown_{i}" for i in range(len(columns), raw.shape[1])]
+        raw.columns = columns[:raw.shape[1]]
+
+        if "date" in raw.columns and "time" in raw.columns:
+            dt_text = raw["date"].astype(str) + " " + raw["time"].astype(str)
+        elif "datetime" in raw.columns:
+            dt_text = raw["datetime"]
+        elif "time" in raw.columns:
+            dt_text = raw["time"]
         else:
-            dt = df.iloc[:,0].astype(str)
-        mapping = {}
-        for target in ("open","high","low","close","tick_volume","volume","spread"):
-            if target in df.columns: mapping[target] = target
-        out = pd.DataFrame({"time": pd.to_datetime(dt, errors="coerce")})
-        for target, source in mapping.items():
-            out[target] = pd.to_numeric(df[source], errors="coerce")
+            dt_text = raw.iloc[:, 0]
+
+        aliases = {
+            "open": ("open",),
+            "high": ("high",),
+            "low": ("low",),
+            "close": ("close",),
+            "tick_volume": ("tick_volume", "tickvol", "tickvolume"),
+            "volume": ("volume", "vol"),
+            "spread": ("spread",),
+        }
+        out["time"] = _parse_datetime(dt_text)
+        for target, candidates in aliases.items():
+            for candidate in candidates:
+                if candidate in raw.columns:
+                    out[target] = pd.to_numeric(raw[candidate], errors="coerce")
+                    break
     else:
-        if len(data[0]) < 6:
-            raise ValueError("MT5形式として列数が不足しています")
-        # Standard MT5: date, time, open, high, low, close, tickvol, vol, spread
-        out = pd.DataFrame()
-        out["time"] = pd.to_datetime(pd.Series([r[0]+" "+r[1] for r in data]), errors="coerce")
-        names = ["open","high","low","close","tick_volume","volume","spread"]
-        for i, name in enumerate(names, start=2):
-            if i < max(map(len,data)):
-                out[name] = pd.to_numeric(pd.Series([r[i] if i < len(r) else None for r in data]), errors="coerce")
-    out = out.dropna(subset=["time","open","high","low","close"]).sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    if len(out) < 100:
-        raise ValueError("有効なローソク足が100本未満です")
-    return out, {"encoding":enc,"delimiter":"tab" if delim=="\t" else "comma","bars":len(out),
-                 "first":str(out.time.iloc[0]),"last":str(out.time.iloc[-1])}
+        first_has_time = raw.iloc[:, 0].astype(str).str.contains(
+            r"\d{1,2}:\d{2}", regex=True, na=False
+        ).mean() > 0.5
+        if first_has_time:
+            dt_text = raw.iloc[:, 0]
+            price_start = 1
+        else:
+            dt_text = raw.iloc[:, 0].astype(str) + " " + raw.iloc[:, 1].astype(str)
+            price_start = 2
+
+        out["time"] = _parse_datetime(dt_text)
+        names = ["open", "high", "low", "close",
+                 "tick_volume", "volume", "spread"]
+        for offset, name in enumerate(names):
+            column_index = price_start + offset
+            if column_index < raw.shape[1]:
+                out[name] = pd.to_numeric(raw.iloc[:, column_index], errors="coerce")
+
+    out = (
+        out.dropna(subset=["time", "open", "high", "low", "close"])
+        .sort_values("time")
+        .drop_duplicates("time")
+        .reset_index(drop=True)
+    )
+
+    meta = {
+        "encoding": report["encoding"],
+        "delimiter": report["delimiter"],
+        "layout": report["layout"],
+        "bars": len(out),
+        "first": str(out["time"].iloc[0]),
+        "last": str(out["time"].iloc[-1]),
+        "timeframe": report["timeframe"],
+    }
+    return out, meta
+
 
 def add_builtin_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     x = df.copy()
