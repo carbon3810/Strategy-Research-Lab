@@ -187,6 +187,80 @@ def load_settings_file(path: str | Path) -> dict[str, Any]:
     return validate_settings_dict(cfg)
 
 
+class ToolTip:
+    """Tkinterウィジェットにマウスオーバー説明を表示します。"""
+
+    def __init__(
+        self,
+        widget: tk.Widget,
+        text: str,
+        *,
+        delay_ms: int = 350,
+        wraplength: int = 430,
+    ) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self.wraplength = wraplength
+        self._after_id: str | None = None
+        self._window: tk.Toplevel | None = None
+
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event: tk.Event | None = None) -> None:
+        self._cancel_schedule()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel_schedule(self) -> None:
+        if self._after_id is not None:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self) -> None:
+        self._after_id = None
+        if self._window is not None or not self.text:
+            return
+
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+
+        window = tk.Toplevel(self.widget)
+        self._window = window
+        window.wm_overrideredirect(True)
+        try:
+            window.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        window.wm_geometry(f"+{x}+{y}")
+
+        frame = tk.Frame(
+            window,
+            background="#fffbe6",
+            relief="solid",
+            borderwidth=1,
+        )
+        frame.pack()
+        label = tk.Label(
+            frame,
+            text=self.text,
+            justify="left",
+            background="#fffbe6",
+            foreground="#222222",
+            padx=10,
+            pady=8,
+            wraplength=self.wraplength,
+        )
+        label.pack()
+
+    def _hide(self, _event: tk.Event | None = None) -> None:
+        self._cancel_schedule()
+        if self._window is not None:
+            self._window.destroy()
+            self._window = None
+
+
 class StrategyResearchLabApp(tk.Tk):
     PHASE_RANGES = {
         "lower_csv": (0.00, 0.08),
@@ -266,32 +340,107 @@ class StrategyResearchLabApp(tk.Tk):
 
         settings = ttk.LabelFrame(self, text="主要設定")
         settings.pack(fill="x", padx=12, pady=6)
-        labels = [
-            ("最大条件数", "max_conditions"),
-            ("最大候補数", "max_candidates"),
-            ("最低取引数", "min_trades"),
-            ("最大保有本数", "max_hold_bars"),
-            ("学習終了年", "train_end"),
-            ("確認終了年", "valid_end"),
+        setting_items = [
+            (
+                "最大売買条件数",
+                "max_conditions",
+                "1つの売買ルールに組み合わせる条件の最大数です。\n\n"
+                "例：\n"
+                "・価格がEMA200より上\n"
+                "・RSIが30以下\n"
+                "・NY時間\n"
+                "この場合は3条件です。\n\n"
+                "条件を増やすほど複雑なルールを探索できますが、"
+                "処理時間と過剰最適化の危険も増えます。\n\n"
+                "初期値・推奨値：3",
+            ),
+            (
+                "探索候補数",
+                "max_candidates",
+                "評価する条件の組み合わせ数です。\n\n"
+                "数を増やすほど広く探索できますが、処理時間も長くなります。\n\n"
+                "目安：\n"
+                "・100：動作確認向け\n"
+                "・300：標準\n"
+                "・1000以上：詳細探索向け\n\n"
+                "初期値・推奨値：300",
+            ),
+            (
+                "採用する最低年間取引数",
+                "min_trades",
+                "学習期間の各年について、最低限必要とする取引回数です。\n\n"
+                "取引回数が少なすぎる候補は、偶然よく見えている可能性があるため除外します。\n\n"
+                "例：100なら、学習期間が5年間の場合、"
+                "学習期間全体では原則500回以上が必要です。\n\n"
+                "初期値・推奨値：100回／年",
+            ),
+            (
+                "時間切れ決済（下位足本数）",
+                "max_hold_bars",
+                "エントリー後、最大で何本の下位足ローソク足を保有するかを設定します。\n\n"
+                "SL・TPに到達しないまま指定本数を超えた場合は、時間切れで決済します。\n\n"
+                "例：下位足がM5で48本なら、48×5分＝240分、約4時間です。\n"
+                "上位足H1の48本ではありません。\n\n"
+                "初期値・推奨値：48",
+            ),
+            (
+                "学習データ終了年",
+                "train_end",
+                "売買ルールを作るために使用する学習期間の終了年です。\n\n"
+                "例：CSVが2019年開始で設定が2023なら、"
+                "2019～2023年を学習データとして使用します。\n\n"
+                "初期値：2023",
+            ),
+            (
+                "検証データ終了年",
+                "valid_end",
+                "学習データで見つけたルールを確認する検証期間の終了年です。\n\n"
+                "例：学習終了年が2023、検証終了年が2024なら、\n"
+                "・～2023年：学習\n"
+                "・2024年：検証\n"
+                "・2025年以降：OOS（未知データ）\n"
+                "として評価します。\n\n"
+                "初期値：2024",
+            ),
         ]
-        for index, (label, key) in enumerate(labels):
-            ttk.Label(settings, text=label).grid(
-                row=index // 3 * 2,
-                column=index % 3,
+        self._tooltips: list[ToolTip] = []
+        for index, (label, key, help_text) in enumerate(setting_items):
+            label_row = index // 3 * 2
+            column = index % 3
+
+            label_frame = ttk.Frame(settings)
+            label_frame.grid(
+                row=label_row,
+                column=column,
                 sticky="w",
                 **pad,
             )
+            ttk.Label(label_frame, text=label).pack(side="left")
+            help_label = ttk.Label(
+                label_frame,
+                text=" ？ ",
+                cursor="question_arrow",
+                foreground="#1f5fa8",
+                font=("", 9, "bold"),
+            )
+            help_label.pack(side="left", padx=(4, 0))
+            self._tooltips.append(ToolTip(help_label, help_text))
+
             variable = tk.StringVar()
             self.inputs[key] = variable
-            ttk.Entry(
-                settings, textvariable=variable, width=16
-            ).grid(
-                row=index // 3 * 2 + 1,
-                column=index % 3,
+            entry = ttk.Entry(
+                settings,
+                textvariable=variable,
+                width=16,
+            )
+            entry.grid(
+                row=label_row + 1,
+                column=column,
                 sticky="ew",
                 **pad,
             )
-            settings.columnconfigure(index % 3, weight=1)
+            self._tooltips.append(ToolTip(entry, help_text))
+            settings.columnconfigure(column, weight=1)
 
         progress_box = ttk.LabelFrame(self, text="処理状況")
         progress_box.pack(fill="x", padx=12, pady=8)
@@ -537,12 +686,12 @@ class StrategyResearchLabApp(tk.Tk):
     def sync_cfg(self) -> dict[str, Any]:
         cfg = dict(self.cfg)
         labels = {
-            "max_conditions": "最大条件数",
-            "max_candidates": "最大候補数",
-            "min_trades": "最低取引数",
-            "max_hold_bars": "最大保有本数",
-            "train_end": "学習終了年",
-            "valid_end": "確認終了年",
+            "max_conditions": "最大売買条件数",
+            "max_candidates": "探索候補数",
+            "min_trades": "採用する最低年間取引数",
+            "max_hold_bars": "時間切れ決済（下位足本数）",
+            "train_end": "学習データ終了年",
+            "valid_end": "検証データ終了年",
         }
         parsed: dict[str, int] = {}
         errors: list[str] = []

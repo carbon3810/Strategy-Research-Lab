@@ -57,7 +57,7 @@ class ResearchController:
         on_log: LogCallback,
     ) -> ResearchResult:
         self.reset_cancel()
-        cfg = request.settings
+        cfg = dict(request.settings)
         total_steps = 9
 
         on_progress("lower_csv", 0, 1, {
@@ -68,6 +68,30 @@ class ResearchController:
         lower, lower_meta = read_mt5_csv(request.lower_csv)
         self._check_cancel()
         on_log(f"下位足: {lower_meta}")
+
+        # GUIの min_trades は「年間取引数」として扱います。
+        # 既存core.pyは学習期間全体の最低取引数を受け取るため、
+        # 学習対象年数を掛けて互換変換します。
+        annual_min_trades = int(cfg.get("min_trades", 100))
+        train_end = int(cfg.get("split_years", {}).get("train_end", 2023))
+        train_years = sorted(
+            int(year)
+            for year in lower["time"].dt.year.dropna().unique()
+            if int(year) <= train_end
+        )
+        train_year_count = max(len(train_years), 1)
+        effective_train_min_trades = annual_min_trades * train_year_count
+
+        runtime_cfg = dict(cfg)
+        runtime_cfg["split_years"] = dict(cfg.get("split_years", {}))
+        runtime_cfg["min_annual_trades"] = annual_min_trades
+        runtime_cfg["min_trades"] = effective_train_min_trades
+
+        on_log(
+            "最低取引数: "
+            f"{annual_min_trades:,}回/年 × 学習{train_year_count}年 "
+            f"= 学習期間全体で最低{effective_train_min_trades:,}回"
+        )
         on_progress("lower_csv", 1, 1, {
             "step": 1, "total_steps": total_steps,
             "message": f"下位足CSV読込完了（{len(lower):,}本）",
@@ -89,7 +113,7 @@ class ResearchController:
 
         features = add_builtin_features(
             lower,
-            cfg,
+            runtime_cfg,
             progress=lower_feature_progress,
             should_cancel=self.is_cancelled,
             label="下位足",
@@ -123,7 +147,7 @@ class ResearchController:
 
             higher_features = add_builtin_features(
                 higher,
-                cfg,
+                runtime_cfg,
                 progress=higher_feature_progress,
                 should_cancel=self.is_cancelled,
                 label="上位足",
@@ -187,7 +211,7 @@ class ResearchController:
 
         ranking, _ = auto_discover(
             features,
-            cfg,
+            runtime_cfg,
             progress=search_progress,
             should_cancel=self.is_cancelled,
             stage_progress=stage_progress,
@@ -199,7 +223,11 @@ class ResearchController:
             "message": "ランキング作成・結果を保存中",
             "next": "完了",
         })
-        save_outputs(request.output_dir, ranking, features, cfg)
+        output_cfg = dict(cfg)
+        output_cfg["min_annual_trades"] = annual_min_trades
+        output_cfg["effective_train_min_trades"] = effective_train_min_trades
+        output_cfg["train_year_count"] = train_year_count
+        save_outputs(request.output_dir, ranking, features, output_cfg)
         on_progress("save", 1, 1, {
             "step": 9, "total_steps": total_steps,
             "message": f"保存完了（候補 {len(ranking):,}件）",
