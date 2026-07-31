@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import csv, json, math, re, importlib.util, sys
 from pathlib import Path
@@ -636,7 +637,7 @@ def simulate(df: pd.DataFrame, entry_mask: pd.Series, side: str, rr: float, stop
            "pf":pf,"total_r":float(r.sum()),"avg_r":float(r.mean()),"max_dd_r":float(dd.max() if len(dd) else 0)}
     return stats,results
 
-def auto_discover(df: pd.DataFrame, cfg: dict, progress=None):
+def auto_discover(df: pd.DataFrame, cfg: dict, progress=None, should_cancel=None):
     conds=build_conditions(df,cfg)
     names=sorted(conds)
     max_k=int(cfg.get("max_conditions",3))
@@ -659,9 +660,13 @@ def auto_discover(df: pd.DataFrame, cfg: dict, progress=None):
     ranking=[]; trades_top=[]
     total=max(1,len(combos)*len(rr_values)*len(stop_values)*len(sides)); done=0
     for combo in combos:
+        if should_cancel and should_cancel():
+            raise InterruptedError("ユーザー操作により自動探索を中断しました。")
         mask=pd.Series(True,index=df.index)
         for c in combo: mask &= conds[c]
         for side,rr,sm in product(sides,rr_values,stop_values):
+            if should_cancel and should_cancel():
+                raise InterruptedError("ユーザー操作により自動探索を中断しました。")
             row={"conditions":" AND ".join(combo),"side":side,"rr":rr,"stop_atr":sm}
             okay=True
             all_period_trades=[]
@@ -676,8 +681,15 @@ def auto_discover(df: pd.DataFrame, cfg: dict, progress=None):
                           min(row["oos_trades"]/max(min_trades,1),2)*0.10 -
                           min(row["oos_max_dd_r"]/100,2)*0.10)
             if okay: ranking.append(row)
-            done+=1
-            if progress and done%10==0: progress(done,total)
+            done += 1
+            if progress and (done % 10 == 0 or done == total):
+                detail = {
+                    "conditions": " AND ".join(combo),
+                    "side": side,
+                    "rr": rr,
+                    "stop_atr": sm,
+                }
+                progress(done, total, detail)
     ranking=sorted(ranking,key=lambda z:z["score"],reverse=True)
     return pd.DataFrame(ranking), conds
 
