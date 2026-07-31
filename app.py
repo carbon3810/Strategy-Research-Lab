@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import json, threading, traceback
 from pathlib import Path
@@ -231,15 +230,12 @@ class App(tk.Tk):
             self.write(f"設定JSON読込成功: {p}")
             self.write("settings_used.json をそのまま再利用できます。")
         except SettingsValidationError as e:
-            details = "
-".join(f"・{x}" for x in e.errors)
+            details = "\n".join(f"・{x}" for x in e.errors)
             self.write("設定JSON読込失敗:")
             self.write(details)
             messagebox.showerror(
                 "設定JSONを読み込めません",
-                "次の問題を修正してください。
-
-" + details
+                "次の問題を修正してください。\n\n" + details
             )
         except Exception:
             details = traceback.format_exc()
