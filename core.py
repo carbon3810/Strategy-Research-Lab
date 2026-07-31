@@ -536,16 +536,38 @@ def read_mt5_csv(path: str) -> tuple[pd.DataFrame, dict]:
     return out, meta
 
 
-def add_builtin_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+def add_builtin_features(
+    df: pd.DataFrame,
+    cfg: dict,
+    progress=None,
+    should_cancel=None,
+    label="特徴量生成"
+) -> pd.DataFrame:
+    def notify(message):
+        if should_cancel and should_cancel():
+            raise InterruptedError("ユーザー操作により処理を中断しました。")
+        if progress:
+            progress(message)
+
     x = df.copy()
     periods = sorted(set(cfg.get("ema_periods",[20,50,200])))
+
+    notify(f"{label}: データコピー完了（{len(x):,}本）")
     for n in periods:
+        notify(f"{label}: EMA{n}を計算中")
         x[f"ema_{n}"] = x.close.ewm(span=n, adjust=False).mean()
         x[f"above_ema_{n}"] = x.close > x[f"ema_{n}"]
         x[f"ema_{n}_slope"] = x[f"ema_{n}"].pct_change(cfg.get("slope_lookback",5))
-    tr = pd.concat([(x.high-x.low),(x.high-x.close.shift()).abs(),(x.low-x.close.shift()).abs()],axis=1).max(axis=1)
+
+    notify(f"{label}: ATRを計算中")
+    tr = pd.concat(
+        [(x.high-x.low),(x.high-x.close.shift()).abs(),(x.low-x.close.shift()).abs()],
+        axis=1
+    ).max(axis=1)
     atr_n = int(cfg.get("atr_period",14))
     x["atr"] = tr.ewm(alpha=1/atr_n, adjust=False).mean()
+
+    notify(f"{label}: ローソク足特徴量を計算中")
     x["body"] = (x.close-x.open).abs()
     x["range"] = (x.high-x.low).replace(0,np.nan)
     x["body_ratio"] = x.body/x.range
@@ -553,21 +575,40 @@ def add_builtin_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     x["lower_wick_ratio"] = (x[["open","close"]].min(axis=1)-x.low)/x.range
     x["bull"] = x.close > x.open
     x["bear"] = x.close < x.open
-    x["bull_engulf"] = x.bull & x.open.le(x.close.shift()) & x.close.ge(x.open.shift()) & x.body.gt(x.body.shift())
-    x["bear_engulf"] = x.bear & x.open.ge(x.close.shift()) & x.close.le(x.open.shift()) & x.body.gt(x.body.shift())
+    x["bull_engulf"] = (
+        x.bull
+        & x.open.le(x.close.shift())
+        & x.close.ge(x.open.shift())
+        & x.body.gt(x.body.shift())
+    )
+    x["bear_engulf"] = (
+        x.bear
+        & x.open.ge(x.close.shift())
+        & x.close.le(x.open.shift())
+        & x.body.gt(x.body.shift())
+    )
+
+    notify(f"{label}: ブレイクアウト特徴量を計算中")
     look = int(cfg.get("breakout_lookback",20))
     x["high_breakout"] = x.close > x.high.shift(1).rolling(look).max()
     x["low_breakout"] = x.close < x.low.shift(1).rolling(look).min()
+
+    notify(f"{label}: 時間帯・ボラティリティ特徴量を計算中")
     x["hour"] = x.time.dt.hour
     x["weekday"] = x.time.dt.weekday
     x["atr_pct"] = x.atr/x.close
     x["volatility_high"] = x.atr_pct > x.atr_pct.rolling(200).median()
+
     for name, func in registry.indicators.items():
+        notify(f"{label}: プラグイン指標「{name}」を計算中")
         result = func(x, cfg.get("plugin_params",{}).get(name,{}))
         if isinstance(result, pd.Series):
             x[name] = result
         elif isinstance(result, pd.DataFrame):
-            for c in result.columns: x[c] = result[c]
+            for c in result.columns:
+                x[c] = result[c]
+
+    notify(f"{label}: 完了")
     return x
 
 def align_higher(lower: pd.DataFrame, higher: pd.DataFrame) -> pd.DataFrame:
@@ -599,99 +640,265 @@ def build_conditions(df: pd.DataFrame, cfg: dict) -> dict[str,pd.Series]:
         cond[name] = func(df, cfg.get("plugin_params",{}).get(name,{})).fillna(False).astype(bool)
     return cond
 
-def simulate(df: pd.DataFrame, entry_mask: pd.Series, side: str, rr: float, stop_mult: float, max_hold: int) -> tuple[dict,list]:
-    idxs = np.flatnonzero(entry_mask.to_numpy())
-    results=[]
-    for i in idxs:
-        if i+1 >= len(df): continue
-        entry_i=i+1
-        entry=float(df.open.iloc[entry_i])
-        atr=float(df.atr.iloc[i]) if pd.notna(df.atr.iloc[i]) else math.nan
-        if not math.isfinite(atr) or atr <= 0: continue
-        risk=atr*stop_mult
-        if side=="BUY": sl, tp = entry-risk, entry+risk*rr
-        else: sl, tp = entry+risk, entry-risk*rr
-        exit_r=0.0; exit_i=min(entry_i+max_hold,len(df)-1); reason="TIME"
-        for j in range(entry_i, min(entry_i+max_hold+1,len(df))):
-            hi,lo=float(df.high.iloc[j]),float(df.low.iloc[j])
-            hit_sl = lo<=sl if side=="BUY" else hi>=sl
-            hit_tp = hi>=tp if side=="BUY" else lo<=tp
-            if hit_sl and hit_tp:
-                exit_r=-1.0; exit_i=j; reason="SL_samebar"; break
-            if hit_sl:
-                exit_r=-1.0; exit_i=j; reason="SL"; break
-            if hit_tp:
-                exit_r=rr; exit_i=j; reason="TP"; break
-        else:
-            close=float(df.close.iloc[exit_i])
-            exit_r=(close-entry)/risk if side=="BUY" else (entry-close)/risk
-        results.append({"entry_time":df.time.iloc[entry_i],"exit_time":df.time.iloc[exit_i],
-                        "side":side,"entry":entry,"sl":sl,"tp":tp,"R":exit_r,"reason":reason})
-    if not results:
-        return {"trades":0,"wins":0,"win_rate":0,"pf":0,"total_r":0,"max_dd_r":0}, []
-    r=np.array([z["R"] for z in results],dtype=float)
-    gross_win=r[r>0].sum(); gross_loss=-r[r<0].sum()
-    pf=float(gross_win/gross_loss) if gross_loss>0 else float("inf")
-    eq=np.cumsum(r); peak=np.maximum.accumulate(np.r_[0,eq]); dd=peak[1:]-eq
-    stats={"trades":len(r),"wins":int((r>0).sum()),"win_rate":float((r>0).mean()*100),
-           "pf":pf,"total_r":float(r.sum()),"avg_r":float(r.mean()),"max_dd_r":float(dd.max() if len(dd) else 0)}
-    return stats,results
+def _stats_from_r(r: np.ndarray) -> dict:
+    r = np.asarray(r, dtype=float)
+    r = r[np.isfinite(r)]
+    if r.size == 0:
+        return {
+            "trades": 0, "wins": 0, "win_rate": 0.0, "pf": 0.0,
+            "total_r": 0.0, "avg_r": 0.0, "max_dd_r": 0.0
+        }
+    gross_win = float(r[r > 0].sum())
+    gross_loss = float(-r[r < 0].sum())
+    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+    eq = np.cumsum(r)
+    peak = np.maximum.accumulate(np.r_[0.0, eq])
+    dd = peak[1:] - eq
+    return {
+        "trades": int(r.size),
+        "wins": int((r > 0).sum()),
+        "win_rate": float((r > 0).mean() * 100.0),
+        "pf": float(pf),
+        "total_r": float(r.sum()),
+        "avg_r": float(r.mean()),
+        "max_dd_r": float(dd.max() if dd.size else 0.0),
+    }
 
-def auto_discover(df: pd.DataFrame, cfg: dict, progress=None, should_cancel=None):
-    conds=build_conditions(df,cfg)
-    names=sorted(conds)
-    max_k=int(cfg.get("max_conditions",3))
-    min_trades=int(cfg.get("min_trades",100))
-    max_candidates=int(cfg.get("max_candidates",300))
-    rr_values=cfg.get("rr_values",[1.0,1.5,2.0])
-    stop_values=cfg.get("stop_mult_values",[1.0])
-    sides=cfg.get("sides",["BUY","SELL"])
-    combos=[]
-    for k in range(1,max_k+1):
-        for c in combinations(names,k):
+
+def _precompute_outcomes(
+    df: pd.DataFrame,
+    sides,
+    rr_values,
+    stop_values,
+    max_hold: int,
+    progress=None,
+    should_cancel=None,
+):
+    """
+    各バーをシグナル発生位置と仮定したR損益を、パラメータごとに一度だけ計算する。
+    条件候補ごとに同じSL/TP走査を繰り返さないため、探索を大幅に高速化できる。
+    """
+    n = len(df)
+    open_ = df["open"].to_numpy(dtype=np.float64, copy=False)
+    high = df["high"].to_numpy(dtype=np.float64, copy=False)
+    low = df["low"].to_numpy(dtype=np.float64, copy=False)
+    close = df["close"].to_numpy(dtype=np.float64, copy=False)
+    atr = df["atr"].to_numpy(dtype=np.float64, copy=False)
+
+    parameter_sets = list(product(sides, rr_values, stop_values))
+    outcomes = {}
+    total = max(len(parameter_sets), 1)
+
+    # シグナル位置 i のエントリーは i+1 の始値。
+    valid_signal = np.arange(n) < n - 1
+    entry = np.full(n, np.nan, dtype=np.float64)
+    entry[:-1] = open_[1:]
+
+    for p_index, (side, rr, stop_mult) in enumerate(parameter_sets, start=1):
+        if should_cancel and should_cancel():
+            raise InterruptedError("ユーザー操作により自動探索を中断しました。")
+
+        rr = float(rr)
+        stop_mult = float(stop_mult)
+        risk = atr * stop_mult
+        valid = valid_signal & np.isfinite(entry) & np.isfinite(risk) & (risk > 0)
+
+        if side == "BUY":
+            sl = entry - risk
+            tp = entry + risk * rr
+        else:
+            sl = entry + risk
+            tp = entry - risk * rr
+
+        result = np.full(n, np.nan, dtype=np.float64)
+        unresolved = valid.copy()
+
+        # 将来足をオフセット単位で一括比較する。
+        for offset in range(1, max_hold + 1):
+            if should_cancel and should_cancel():
+                raise InterruptedError("ユーザー操作により自動探索を中断しました。")
+            limit = n - offset
+            if limit <= 0:
+                break
+
+            active_idx = np.flatnonzero(unresolved[:limit])
+            if active_idx.size == 0:
+                break
+            future_idx = active_idx + offset
+            hi = high[future_idx]
+            lo = low[future_idx]
+
+            if side == "BUY":
+                hit_sl = lo <= sl[active_idx]
+                hit_tp = hi >= tp[active_idx]
+            else:
+                hit_sl = hi >= sl[active_idx]
+                hit_tp = lo <= tp[active_idx]
+
+            # 同一足で両方到達した場合は保守的にSL。
+            sl_idx = active_idx[hit_sl]
+            if sl_idx.size:
+                result[sl_idx] = -1.0
+                unresolved[sl_idx] = False
+
+            tp_only = (~hit_sl) & hit_tp
+            tp_idx = active_idx[tp_only]
+            if tp_idx.size:
+                result[tp_idx] = rr
+                unresolved[tp_idx] = False
+
+        # 最大保有本数まで未決着なら、その足の終値でR換算。
+        unresolved_idx = np.flatnonzero(unresolved)
+        if unresolved_idx.size:
+            exit_idx = np.minimum(unresolved_idx + max_hold, n - 1)
+            if side == "BUY":
+                result[unresolved_idx] = (
+                    close[exit_idx] - entry[unresolved_idx]
+                ) / risk[unresolved_idx]
+            else:
+                result[unresolved_idx] = (
+                    entry[unresolved_idx] - close[exit_idx]
+                ) / risk[unresolved_idx]
+
+        outcomes[(side, rr, stop_mult)] = result
+        if progress:
+            progress(
+                p_index,
+                total,
+                {
+                    "phase": "outcomes",
+                    "side": side,
+                    "rr": rr,
+                    "stop_atr": stop_mult,
+                },
+            )
+    return outcomes
+
+
+def auto_discover(
+    df: pd.DataFrame,
+    cfg: dict,
+    progress=None,
+    should_cancel=None,
+    stage_progress=None,
+):
+    if stage_progress:
+        stage_progress("conditions", 0, 1, "探索条件を生成中")
+    conds = build_conditions(df, cfg)
+    names = sorted(conds)
+    max_k = int(cfg.get("max_conditions", 3))
+    min_trades = int(cfg.get("min_trades", 100))
+    max_candidates = int(cfg.get("max_candidates", 300))
+    rr_values = [float(v) for v in cfg.get("rr_values", [1.0, 1.5, 2.0])]
+    stop_values = [float(v) for v in cfg.get("stop_mult_values", [1.0])]
+    sides = cfg.get("sides", ["BUY", "SELL"])
+
+    combos = []
+    for k in range(1, max_k + 1):
+        for c in combinations(names, k):
             combos.append(c)
-            if len(combos)>=max_candidates: break
-        if len(combos)>=max_candidates: break
-    split=cfg.get("split_years",{})
-    train_end=int(split.get("train_end",2023)); valid_end=int(split.get("valid_end",2024))
-    periods={"train":df.time.dt.year<=train_end,
-             "valid":(df.time.dt.year>train_end)&(df.time.dt.year<=valid_end),
-             "oos":df.time.dt.year>valid_end}
-    ranking=[]; trades_top=[]
-    total=max(1,len(combos)*len(rr_values)*len(stop_values)*len(sides)); done=0
+            if len(combos) >= max_candidates:
+                break
+        if len(combos) >= max_candidates:
+            break
+    if stage_progress:
+        stage_progress("conditions", 1, 1, f"探索条件生成完了（{len(combos):,}候補）")
+
+    max_hold = int(cfg.get("max_hold_bars", 48))
+    if stage_progress:
+        stage_progress("outcomes", 0, max(1, len(sides) * len(rr_values) * len(stop_values)),
+                       "SL/TP結果を事前計算中")
+
+    def outcome_progress(done, total, detail):
+        if stage_progress:
+            stage_progress(
+                "outcomes", done, total,
+                f"{detail['side']} / RR {detail['rr']} / SL ATR×{detail['stop_atr']}"
+            )
+
+    outcomes = _precompute_outcomes(
+        df, sides, rr_values, stop_values, max_hold,
+        progress=outcome_progress,
+        should_cancel=should_cancel,
+    )
+
+    split = cfg.get("split_years", {})
+    train_end = int(split.get("train_end", 2023))
+    valid_end = int(split.get("valid_end", 2024))
+    years = df.time.dt.year.to_numpy()
+    periods = {
+        "train": years <= train_end,
+        "valid": (years > train_end) & (years <= valid_end),
+        "oos": years > valid_end,
+    }
+
+    # pandas Seriesの論理積を何千回も繰り返さないようNumPy boolへ変換。
+    cond_arrays = {
+        name: series.fillna(False).to_numpy(dtype=bool, copy=False)
+        for name, series in conds.items()
+    }
+
+    ranking = []
+    total = max(1, len(combos) * len(rr_values) * len(stop_values) * len(sides))
+    done = 0
     for combo in combos:
         if should_cancel and should_cancel():
             raise InterruptedError("ユーザー操作により自動探索を中断しました。")
-        mask=pd.Series(True,index=df.index)
-        for c in combo: mask &= conds[c]
-        for side,rr,sm in product(sides,rr_values,stop_values):
+
+        mask = np.ones(len(df), dtype=bool)
+        for condition_name in combo:
+            mask &= cond_arrays[condition_name]
+
+        for side, rr, stop_mult in product(sides, rr_values, stop_values):
             if should_cancel and should_cancel():
                 raise InterruptedError("ユーザー操作により自動探索を中断しました。")
-            row={"conditions":" AND ".join(combo),"side":side,"rr":rr,"stop_atr":sm}
-            okay=True
-            all_period_trades=[]
-            for pname,pmask in periods.items():
-                st,tr=simulate(df,mask&pmask,side,float(rr),float(sm),int(cfg.get("max_hold_bars",48)))
-                for key,val in st.items(): row[f"{pname}_{key}"]=val
-                if pname=="train" and st["trades"]<min_trades: okay=False
-                if pname=="oos": all_period_trades=tr
-            # Stability-oriented score, not PF-only
-            def finite_pf(v): return min(float(v),5.0) if math.isfinite(float(v)) else 5.0
-            row["score"]=(finite_pf(row["valid_pf"])*0.35 + finite_pf(row["oos_pf"])*0.45 +
-                          min(row["oos_trades"]/max(min_trades,1),2)*0.10 -
-                          min(row["oos_max_dd_r"]/100,2)*0.10)
-            if okay: ranking.append(row)
+
+            result = outcomes[(side, float(rr), float(stop_mult))]
+            row = {
+                "conditions": " AND ".join(combo),
+                "side": side,
+                "rr": float(rr),
+                "stop_atr": float(stop_mult),
+            }
+            okay = True
+            for period_name, period_mask in periods.items():
+                selected_r = result[mask & period_mask]
+                stats = _stats_from_r(selected_r)
+                for key, value in stats.items():
+                    row[f"{period_name}_{key}"] = value
+                if period_name == "train" and stats["trades"] < min_trades:
+                    okay = False
+
+            def finite_pf(value):
+                value = float(value)
+                return min(value, 5.0) if math.isfinite(value) else 5.0
+
+            row["score"] = (
+                finite_pf(row["valid_pf"]) * 0.35
+                + finite_pf(row["oos_pf"]) * 0.45
+                + min(row["oos_trades"] / max(min_trades, 1), 2) * 0.10
+                - min(row["oos_max_dd_r"] / 100, 2) * 0.10
+            )
+            if okay:
+                ranking.append(row)
+
             done += 1
             if progress and (done % 10 == 0 or done == total):
-                detail = {
-                    "conditions": " AND ".join(combo),
-                    "side": side,
-                    "rr": rr,
-                    "stop_atr": sm,
-                }
-                progress(done, total, detail)
-    ranking=sorted(ranking,key=lambda z:z["score"],reverse=True)
+                progress(
+                    done,
+                    total,
+                    {
+                        "phase": "search",
+                        "conditions": " AND ".join(combo),
+                        "side": side,
+                        "rr": float(rr),
+                        "stop_atr": float(stop_mult),
+                    },
+                )
+
+    ranking = sorted(ranking, key=lambda z: z["score"], reverse=True)
     return pd.DataFrame(ranking), conds
+
 
 def save_outputs(out_dir: str, ranking: pd.DataFrame, features: pd.DataFrame, cfg: dict):
     p=Path(out_dir); p.mkdir(parents=True,exist_ok=True)
